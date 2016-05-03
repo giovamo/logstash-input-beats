@@ -6,11 +6,12 @@ require "openssl"
 require "zlib"
 require "json"
 require "concurrent"
+require "digest"
 
 module Lumberjack module Beats
   class Server
     SOCKET_TIMEOUT = 1 # seconds
-
+	
     attr_reader :port
 
     # Create a new Lumberjack server.
@@ -51,6 +52,8 @@ module Lumberjack module Beats
       @server = TCPServer.new(@options[:address], @options[:port])
       @close = Concurrent::AtomicBoolean.new
       @port = retrieve_current_port
+      @finger = ""
+      @hashchain = "ciao"
 
       setup_ssl if ssl?
     end # def initialize
@@ -65,14 +68,14 @@ module Lumberjack module Beats
     def run(&block)
       while !closed?
         connection = accept
-
+	
         # Some exception may occur in the accept loop
         # we will try again in the next iteration
         # unless the server is closing
         next unless connection
 
         Thread.new(connection) do |connection|
-          begin
+          begin	
             connection.run(&block)
           rescue Lumberjack::Beats::Connection::ConnectionClosed
             # Connection will raise a wrapped exception upstream,
@@ -97,7 +100,7 @@ module Lumberjack module Beats
         if block_given?
           block.call(socket, self)
         else
-          return Connection.new(socket, self)
+          return Connection.new(socket, self, @finger) 
         end
       rescue OpenSSL::SSL::SSLError, IOError, EOFError, Errno::EBADF
         socket.close rescue nil
@@ -115,10 +118,11 @@ module Lumberjack module Beats
     def accept_ssl(tcp_socket)
       ssl_socket = OpenSSL::SSL::SSLSocket.new(tcp_socket, @ssl)
       ssl_socket.sync_close
-
       begin
         ssl_socket.accept_nonblock
 
+	cert = ssl_socket.peer_cert
+	@finger = OpenSSL::Digest::SHA1.new(cert.to_der).to_s
         return ssl_socket
       rescue IO::WaitReadable # handshake
         IO.select([ssl_socket], nil, nil, SOCKET_TIMEOUT)
@@ -418,9 +422,10 @@ module Lumberjack module Beats
     attr_accessor :server
     attr_reader :peer
 
-    def initialize(fd, server)
+    def initialize(fd, server, finger)
       @parser = Parser.new
       @fd = fd
+      @finger_conn = finger
 
       @server = server
       @ack_handler = nil
@@ -467,13 +472,22 @@ module Lumberjack module Beats
           reset_next_ack(*args)
         when :data
           sequence, map = args
-          ack_if_needed(sequence) { data(normalize_v1_metadata_encoding(map), &block) }
+          ack_if_needed(sequence) { data(map, &block) }
         when :json
           # If the payload is an array of items we will emit multiple events
           # this behavior was moved from the plugin to the library.
           # see this commit: https://github.com/logstash-plugins/logstash-input-lumberjack/pull/57/files#diff-1b9590423b15f04f215635164e7376ecR158
           sequence, map = args
+	
+	# code @tesina 
+	  map["fingerprint"] = @finger_conn
 
+	  digest = Digest::SHA256.hexdigest "ciao" #@hashchain
+	  map["hashchain"] = digest
+	  #@hashchain = digest
+	  #@sha256.reset
+
+	# fine code @tesina
           ack_if_needed(sequence) do
             if map.is_a?(Array)
               map.each { |e| data(e, &block) }
@@ -483,15 +497,6 @@ module Lumberjack module Beats
           end
         end
       end
-    end
-
-    def normalize_v1_metadata_encoding(map)
-      # lets normalize the metadata of the v1 frame to make
-      # sure everything is in utf-8 format, because LSF don't enforce the encoding when he send
-      # the data to the server. Path, offset can be in another encoding, when the data is assigned to the event.
-      # the event will validate it and crash when the encoding is in the wrong format.
-      map.each { |k, v| map[k].force_encoding(Encoding::UTF_8) unless k == Lumberjack::Beats::LSF_LOG_LINE_FIELD }
-      map
     end
 
     def version(version)
