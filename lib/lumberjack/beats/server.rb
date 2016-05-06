@@ -6,11 +6,13 @@ require "openssl"
 require "zlib"
 require "json"
 require "concurrent"
+require "digest"
+require "time"
 
 module Lumberjack module Beats
   class Server
     SOCKET_TIMEOUT = 1 # seconds
-
+    
     attr_reader :port
 
     # Create a new Lumberjack server.
@@ -51,9 +53,21 @@ module Lumberjack module Beats
       @server = TCPServer.new(@options[:address], @options[:port])
       @close = Concurrent::AtomicBoolean.new
       @port = retrieve_current_port
-
+      @finger = ""
+      $hashchain = "Initial hash chain"
+      $firstTimestamp = "newChainTimestamp"
+      $sqnc_num = 0
+      
       setup_ssl if ssl?
     end # def initialize
+
+    #def getCurrentHashchainValue()
+	#return $hashchain
+    #end #def getCurrentHashchainValue
+
+    #def setCurrentHashchainValue(hashchainValue)
+	#$hashchain = hashchainValue
+    #end #def setCurrentHashchainValue
 
     # Server#run method, allow the library to manage all the connection
     # threads, this handing is quite minimal and don't handler
@@ -65,14 +79,14 @@ module Lumberjack module Beats
     def run(&block)
       while !closed?
         connection = accept
-
+	
         # Some exception may occur in the accept loop
         # we will try again in the next iteration
         # unless the server is closing
         next unless connection
 
         Thread.new(connection) do |connection|
-          begin
+          begin	
             connection.run(&block)
           rescue Lumberjack::Beats::Connection::ConnectionClosed
             # Connection will raise a wrapped exception upstream,
@@ -97,7 +111,7 @@ module Lumberjack module Beats
         if block_given?
           block.call(socket, self)
         else
-          return Connection.new(socket, self)
+          return Connection.new(socket, self, @finger) 
         end
       rescue OpenSSL::SSL::SSLError, IOError, EOFError, Errno::EBADF
         socket.close rescue nil
@@ -115,10 +129,11 @@ module Lumberjack module Beats
     def accept_ssl(tcp_socket)
       ssl_socket = OpenSSL::SSL::SSLSocket.new(tcp_socket, @ssl)
       ssl_socket.sync_close
-
       begin
         ssl_socket.accept_nonblock
 
+	cert = ssl_socket.peer_cert
+	@finger = OpenSSL::Digest::SHA1.new(cert.to_der).to_s
         return ssl_socket
       rescue IO::WaitReadable # handshake
         IO.select([ssl_socket], nil, nil, SOCKET_TIMEOUT)
@@ -418,9 +433,10 @@ module Lumberjack module Beats
     attr_accessor :server
     attr_reader :peer
 
-    def initialize(fd, server)
+    def initialize(fd, server, finger)
       @parser = Parser.new
       @fd = fd
+      @finger_conn = finger
 
       @server = server
       @ack_handler = nil
@@ -473,7 +489,35 @@ module Lumberjack module Beats
           # this behavior was moved from the plugin to the library.
           # see this commit: https://github.com/logstash-plugins/logstash-input-lumberjack/pull/57/files#diff-1b9590423b15f04f215635164e7376ecR158
           sequence, map = args
-
+	
+	# code @tesina 
+	  map["fingerprint"] = @finger_conn
+	  logTimestamp = Time.parse(map["@timestamp"])
+	  
+	  if $firstTimestamp == "newChainTimestamp"
+	  	$firstTimestamp = Time.new(logTimestamp.year, logTimestamp.month, logTimestamp.day, logTimestamp.hour+2, logTimestamp.min).to_i
+	  else
+		if (logTimestamp.to_i - $firstTimestamp) >= 300
+			$firstTimestamp = Time.new(logTimestamp.year, logTimestamp.month, logTimestamp.day, logTimestamp.hour+2, logTimestamp.min).to_i 
+			$hashchain = "Initial hash chain"
+			#setCurrentHashchainValue("Initial hash chain")
+	  	end
+	  end
+	  
+	  #add message of the log to string to hash
+	  hashchain = ($hashchain + map["message"])
+	  File.open('/tmp/hashRuby.txt', "a+") do |f|
+	  	f.write(hashchain + "\n\n")
+	  end
+	  sqnc_num = $sqnc_num
+	  digest = Digest::SHA256.hexdigest hashchain
+	  map["hashchain"] = digest
+	  map["sqnc_num"] = (sqnc_num+1)
+	  $hashchain = digest
+	  $sqnc_num = (sqnc_num+1)
+	  map["is_valid"] = '' # this is needed to index this field in elasticsearch
+	 
+	# fine code @tesina
           ack_if_needed(sequence) do
             if map.is_a?(Array)
               map.each { |e| data(e, &block) }

@@ -21,3 +21,4 @@ logstash-forwarder
 *.json
 vendor/
 .bundle/
+*~
