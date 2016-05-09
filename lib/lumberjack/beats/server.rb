@@ -53,21 +53,15 @@ module Lumberjack module Beats
       @server = TCPServer.new(@options[:address], @options[:port])
       @close = Concurrent::AtomicBoolean.new
       @port = retrieve_current_port
+      # variables @tesina
       @finger = ""
       $hashchain = "Initial hash chain"
       $firstTimestamp = "newChainTimestamp"
       $sqnc_num = 0
+      # end variables @tesina
       
       setup_ssl if ssl?
     end # def initialize
-
-    #def getCurrentHashchainValue()
-	#return $hashchain
-    #end #def getCurrentHashchainValue
-
-    #def setCurrentHashchainValue(hashchainValue)
-	#$hashchain = hashchainValue
-    #end #def setCurrentHashchainValue
 
     # Server#run method, allow the library to manage all the connection
     # threads, this handing is quite minimal and don't handler
@@ -131,7 +125,7 @@ module Lumberjack module Beats
       ssl_socket.sync_close
       begin
         ssl_socket.accept_nonblock
-
+	# extracting client certificate and computing its fingerprint
 	cert = ssl_socket.peer_cert
 	@finger = OpenSSL::Digest::SHA1.new(cert.to_der).to_s
         return ssl_socket
@@ -490,25 +484,22 @@ module Lumberjack module Beats
           # see this commit: https://github.com/logstash-plugins/logstash-input-lumberjack/pull/57/files#diff-1b9590423b15f04f215635164e7376ecR158
           sequence, map = args
 	
-	# code @tesina 
+	# Begin code @tesina 
 	  map["fingerprint"] = @finger_conn
 	  logTimestamp = Time.parse(map["@timestamp"])
 	  
 	  if $firstTimestamp == "newChainTimestamp"
-	  	$firstTimestamp = Time.new(logTimestamp.year, logTimestamp.month, logTimestamp.day, logTimestamp.hour+2, logTimestamp.min).to_i
+	  	$firstTimestamp = Time.new(logTimestamp.year, logTimestamp.month, logTimestamp.day, logTimestamp.hour+2).to_i
 	  else
-		if (logTimestamp.to_i - $firstTimestamp) >= 300
+		# at the beginning of each hour, the hashchain begins again
+		if (logTimestamp.to_i - $firstTimestamp) >= 3600
 			$firstTimestamp = Time.new(logTimestamp.year, logTimestamp.month, logTimestamp.day, logTimestamp.hour+2, logTimestamp.min).to_i 
 			$hashchain = "Initial hash chain"
-			#setCurrentHashchainValue("Initial hash chain")
 	  	end
 	  end
 	  
-	  #add message of the log to string to hash
+	  #add message of the log to the string to hash
 	  hashchain = ($hashchain + map["message"])
-	  File.open('/tmp/hashRuby.txt', "a+") do |f|
-	  	f.write(hashchain + "\n\n")
-	  end
 	  sqnc_num = $sqnc_num
 	  digest = Digest::SHA256.hexdigest hashchain
 	  map["hashchain"] = digest
@@ -516,8 +507,8 @@ module Lumberjack module Beats
 	  $hashchain = digest
 	  $sqnc_num = (sqnc_num+1)
 	  map["is_valid"] = '' # this is needed to index this field in elasticsearch
-	 
-	# fine code @tesina
+	# end code @tesina
+
           ack_if_needed(sequence) do
             if map.is_a?(Array)
               map.each { |e| data(e, &block) }
